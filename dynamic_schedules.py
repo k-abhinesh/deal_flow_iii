@@ -1,6 +1,7 @@
 import pandas as pd
 import numpy as np
 from math import ceil
+import os
 
 def _normalize_distribution(series):
     """Helper function to ensure a distribution series sums to exactly 1.0."""
