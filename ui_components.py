@@ -1,3 +1,5 @@
+## ui_components.py
+
 import streamlit as st
 import pandas as pd
 import plotly.graph_objects as go
@@ -8,6 +10,7 @@ from finance_functions import validate_schedules, calculate_financial_model
 from ml_functions import prepare_input_features, predict_project
 from nearby_analysis import get_nearby_properties_analysis
 import plotly.express as px
+import numpy as np
 
 def render_prediction_stage():
     """Renders the entire ML prediction stage, including sidebar and main content."""
@@ -15,7 +18,6 @@ def render_prediction_stage():
     st.sidebar.header("🏗️ Project Parameters")
     st.sidebar.subheader("Basic Details")
     
-    # FIX: Use values from session state as defaults to preserve user input
     user_input_defaults = st.session_state.get('user_input', {})
     
     total_area = st.sidebar.number_input("Total Land Area (sqm)", min_value=100, max_value=200000, 
@@ -58,7 +60,6 @@ def render_prediction_stage():
             st.sidebar.error("Please select at least one BHK type or disable customization.")
         else:
             with st.spinner("🧠 Running AI predictions and market analysis..."):
-                # Store the current inputs before running predictions
                 st.session_state.user_input = user_input
                 input_df = prepare_input_features(user_input, st.session_state.feature_names)
                 st.session_state.predictions = predict_project(input_df, st.session_state.models, st.session_state.scalers, st.session_state.feature_names, st.session_state.bhk_mapping, user_input['selected_bhk_types'])
@@ -213,7 +214,6 @@ def render_financial_model_ui():
         st.info("Inputs are pre-filled from ML predictions. You can edit them as needed.")
         if st.button("⬅️ Back to Predictions"):
             st.session_state.view = 'predictor'
-            # Don't clear predictions, so the results page can be shown
             st.session_state.results = None
             st.session_state.schedules_generated = False
             st.rerun()
@@ -238,13 +238,10 @@ def render_financial_model_ui():
             'sales_lounge_cost': st.number_input("Sales Lounge Cost (Lump Sum)", value=50000000),
             'consultant_cost_psf': st.number_input("Consultant Cost (per sq ft of Total SA)", value=300),
             'misc_approval_cost_psf': st.number_input("Misc. Approval Cost (per sq ft of Total SA)", value=50),
+            'debt_interest_rate': st.slider("Interest Rate on Debt (%)", 0.0, 20.0, 13.0) / 100.0,
         }
         base_inputs.update(financial_assumptions)
         
-        st.subheader("Admin Timeline")
-        admin_dates = {'admin_start_date': st.date_input("Admin Cost Start Date", value=pd.to_datetime("2025-06-30")), 'admin_end_date': st.date_input("Admin Cost End Date", value=pd.to_datetime("2032-09-30"))}
-        base_inputs.update(admin_dates)
-
         st.subheader("3. Detailed Phasing Schedules")
         st.info("Set primary inputs above, then generate schedules.")
 
@@ -253,15 +250,18 @@ def render_financial_model_ui():
             construction_phasing_df, dynamic_end_date = dynamic_schedules.generate_construction_phasing(current_inputs['start_date'], current_inputs['land_area'], current_inputs['num_floors'])
             st.session_state.dynamic_end_date, st.session_state.construction_phasing_df = dynamic_end_date, construction_phasing_df
             post_project_q, extended_end_date = pd.Period(dynamic_end_date, freq='Q') + 8, (pd.Period(dynamic_end_date, freq='Q') + 8).end_time
-            admin_end_date_ts = pd.to_datetime(current_inputs['admin_end_date'])
+            
+            admin_end_date_ts = pd.to_datetime(current_inputs.get('admin_end_date', '2032-09-30'))
             master_timeline_range = pd.date_range(start=current_inputs['start_date'], end=max(extended_end_date, admin_end_date_ts), freq='Q')
             master_timeline_labels = [f"Q{q.quarter} {q.year}" for q in master_timeline_range]
-            st.session_state.other_costs_phasing_df = dynamic_schedules.generate_other_costs_phasing(master_timeline_labels, dynamic_end_date)
-            st.session_state.sales_dist_df = dynamic_schedules.generate_sales_distribution(master_timeline_labels, dynamic_end_date)
+            
+            sales_dist_df = dynamic_schedules.generate_sales_distribution(master_timeline_labels, dynamic_end_date)
+            st.session_state.sales_dist_df = sales_dist_df
+            last_sales_quarter_label = sales_dist_df[sales_dist_df['Distribution'] > 0]['Quarter'].iloc[-1]
+            
+            st.session_state.other_costs_phasing_df = dynamic_schedules.generate_other_costs_phasing(master_timeline_labels, dynamic_end_date, last_sales_quarter_label)
             st.session_state.collection_dist_df = dynamic_schedules.generate_collection_distribution(st.session_state.sales_dist_df, master_timeline_labels)
-            admin_timeline_range = pd.date_range(start=current_inputs['admin_start_date'], end=current_inputs['admin_end_date'], freq='Q')
-            admin_timeline_labels = [f"Q{q.quarter} {q.year}" for q in admin_timeline_range]
-            st.session_state.admin_cost_df = dynamic_schedules.generate_admin_cost_schedule(current_inputs['total_saleable_area'], admin_timeline_labels)
+            
             st.session_state.schedules_generated = True
             st.success(f"Schedules generated. Project end date: {dynamic_end_date.strftime('%Y-%m-%d')}")
 
@@ -269,25 +269,50 @@ def render_financial_model_ui():
             generate_schedules(base_inputs)
 
         schedule_inputs = {}
+        percent_format = "%.1f"
+        
         with st.expander("🔨 Construction Costs & Phasing", expanded=True):
             schedule_inputs['construction_stage_costs'] = st.data_editor(pd.DataFrame([{"Stage": "Excavation and Foundation", "Cost Rate (per sq ft of Total SA)": 900}, {"Stage": "RCC", "Cost Rate (per sq ft of Total SA)": 1200}, {"Stage": "MEP", "Cost Rate (per sq ft of Total SA)": 800}, {"Stage": "Finishing", "Cost Rate (per sq ft of Total SA)": 1400}, {"Stage": "Infra and Amenities", "Cost Rate (per sq ft of Total SA)": 700}]), key="csc_editor", hide_index=True)
-            schedule_inputs['construction_phasing'] = st.data_editor(st.session_state.get('construction_phasing_df', pd.DataFrame()), key=f"cp_editor_{st.session_state.reset_counter}", hide_index=True)
-        with st.expander("💰 Sales & Collections Phasing"):
-            schedule_inputs['sales_dist'] = st.data_editor(st.session_state.get('sales_dist_df', pd.DataFrame()), key=f"sd_editor_{st.session_state.reset_counter}", hide_index=True)
-            schedule_inputs['collection_dist'] = st.data_editor(st.session_state.get('collection_dist_df', pd.DataFrame()), key=f"cd_editor_{st.session_state.reset_counter}", hide_index=True)
-        with st.expander("📋 Other Costs Phasing"):
-            schedule_inputs['other_costs_phasing'] = st.data_editor(st.session_state.get('other_costs_phasing_df', pd.DataFrame()), key=f"ocp_editor_{st.session_state.reset_counter}", hide_index=True)
-        with st.expander("👥 Admin Cost Schedule"):
-            schedule_inputs['admin_cost'] = st.data_editor(st.session_state.get('admin_cost_df', pd.DataFrame()), key=f"ac_editor_{st.session_state.reset_counter}", hide_index=True)
+            
+            construction_df = st.session_state.get('construction_phasing_df', pd.DataFrame()).copy()
+            q_cols = [col for col in construction_df.columns if col.startswith('Q')]
+            construction_df[q_cols] = construction_df[q_cols].replace(0, np.nan)
+            construction_q_cols = {col: st.column_config.NumberColumn(format=f"{percent_format}%%") for col in construction_df.columns if col.startswith('Q')}
+            schedule_inputs['construction_phasing'] = st.data_editor(construction_df, column_config=construction_q_cols, key=f"cp_editor_{st.session_state.reset_counter}", hide_index=True)
 
+        with st.expander("💰 Sales & Collections Phasing"):
+            sales_df = st.session_state.get('sales_dist_df', pd.DataFrame()).copy()
+            sales_df['Distribution'] = sales_df['Distribution'].replace(0, np.nan)
+            sales_config = {"Distribution": st.column_config.NumberColumn(format=f"{percent_format}%%")}
+            schedule_inputs['sales_dist'] = st.data_editor(sales_df, column_config=sales_config, key=f"sd_editor_{st.session_state.reset_counter}", hide_index=True)
+
+            collection_df = st.session_state.get('collection_dist_df', pd.DataFrame()).copy()
+            collection_df['Distribution'] = collection_df['Distribution'].replace(0, np.nan)
+            collection_config = {"Distribution": st.column_config.NumberColumn(format=f"{percent_format}%%")}
+            schedule_inputs['collection_dist'] = st.data_editor(collection_df, column_config=collection_config, key=f"cd_editor_{st.session_state.reset_counter}", hide_index=True)
+
+        with st.expander("📋 Other Costs Phasing"):
+            other_costs_df = st.session_state.get('other_costs_phasing_df', pd.DataFrame()).copy()
+            q_cols_other = [col for col in other_costs_df.columns if col.startswith('Q')]
+            other_costs_df[q_cols_other] = other_costs_df[q_cols_other].replace(0, np.nan)
+            other_q_cols_config = {col: st.column_config.NumberColumn(format=f"{percent_format}%%") for col in other_costs_df.columns if col.startswith('Q')}
+            schedule_inputs['other_costs_phasing'] = st.data_editor(other_costs_df, column_config=other_q_cols_config, key=f"ocp_editor_{st.session_state.reset_counter}", hide_index=True)
+        
         if st.button("Calculate Project Financials 🚀", type="primary"):
-            final_inputs = {**base_inputs, **schedule_inputs}
+            calc_schedule_inputs = {k: v.copy() for k, v in schedule_inputs.items()}
+            for key in ['construction_phasing', 'other_costs_phasing', 'sales_dist', 'collection_dist']:
+                if key in calc_schedule_inputs and not calc_schedule_inputs[key].empty:
+                    calc_schedule_inputs[key] = calc_schedule_inputs[key].fillna(0)
+            
+            final_inputs = {**base_inputs, **calc_schedule_inputs}
             final_inputs['end_date'] = st.session_state.get('dynamic_end_date', base_inputs.get('start_date'))
+            
             validation_errors = validate_schedules(final_inputs)
             if validation_errors:
                 for error in validation_errors: st.error(error)
             else:
-                with st.spinner("Running financial model..."): st.session_state['results'] = calculate_financial_model(final_inputs)
+                with st.spinner("Running financial model..."): 
+                    st.session_state['results'] = calculate_financial_model(final_inputs)
 
     # --- Main Panel for Outputs ---
     if st.session_state['results']:
@@ -316,13 +341,15 @@ def render_financial_model_ui():
                 st.subheader("Quarterly Funding View (in Cr)")
                 fig_funding = go.Figure()
                 fig_funding.add_trace(go.Bar(x=master_timeline, y=financials_display['Equity Inflow'], name='Equity Inflow', marker_color=colors['equity']))
-                fig_funding.add_trace(go.Bar(x=master_timeline, y=financials_display['Surplus/(Deficit)'], name='Surplus/(Deficit)', marker_color=colors['surplus']))
+                fig_funding.add_trace(go.Bar(x=master_timeline, y=financials_display['Debt Drawdown'], name='Debt Drawdown', marker_color='orange'))
+                fig_funding.add_trace(go.Bar(x=master_timeline, y=financials_display['Net Cash Flow'], name='Surplus/Deficit', marker_color=colors['surplus']))
                 fig_funding.update_layout(barmode='relative', height=400, yaxis_title="Amount (in Cr)", legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1))
                 st.plotly_chart(fig_funding, use_container_width=True)
             with col2:
                 st.subheader("Cash Balance Over Time (in Cr)")
                 fig_balance = go.Figure()
                 fig_balance.add_trace(go.Scatter(x=master_timeline, y=financials_display['Closing Cash'], name='Cash Balance', fill='tozeroy', line=dict(color=colors['net_cash'])))
+                fig_balance.add_trace(go.Scatter(x=master_timeline, y=financials_display['Closing Debt'], name='Debt Balance', line=dict(color='red')))
                 fig_balance.update_layout(height=400, yaxis_title="Amount (in Cr)", legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1))
                 st.plotly_chart(fig_balance, use_container_width=True)
         with tab2:
@@ -330,7 +357,30 @@ def render_financial_model_ui():
             st.dataframe(cost_summary_display.style.set_table_styles(table_styles).format("₹{:,.2f} Cr"))
         with tab3:
             st.header("Quarterly Cash Flow Details (in Cr)")
-            st.dataframe(cashflow_display.T.style.format(lambda val: "-" if abs(val) < 1e-6 else f"₹{val:,.2f}"))
+            construction_cost_cols = [f"Cost: {stage}" for stage in ["Excavation and Foundation", "RCC", "MEP", "Finishing", "Infra and Amenities"]]
+            
+            cashflow_for_display = cashflow.copy()
+            cashflow_for_display['Cost: Total Construction'] = cashflow_for_display[construction_cost_cols].sum(axis=1)
+            
+            main_cashflow_cols = [col for col in cashflow_for_display.columns if col not in construction_cost_cols and col != 'Cost: Interest']
+            cashflow_summary = cashflow_for_display[main_cashflow_cols]
+            
+            cost_cols = [col for col in cashflow_summary.columns if col.startswith('Cost: ')]
+            final_order = ['Collections'] + cost_cols + ['Total Expenses', 'Net Cash Flow']
+            cashflow_summary = cashflow_summary[final_order]
+
+            cashflow_summary_t = (cashflow_summary / CR).T
+            st.dataframe(cashflow_summary_t.style.format(lambda val: "-" if abs(val) < 1e-9 else f"₹{val:,.2f}"))
+
+            st.subheader("Detailed Construction Costs (in Cr)")
+            construction_details = cashflow[construction_cost_cols].copy()
+            construction_details_t = (construction_details / CR).T
+            construction_details_t['Total'] = construction_details_t.sum(axis=1)
+            construction_details_t.insert(0, 'Total', construction_details_t.pop('Total'))
+            construction_details_t.loc['Total'] = construction_details_t.sum(axis=0)
+            st.dataframe(construction_details_t.style.format(lambda val: "-" if abs(val) < 1e-9 else f"₹{val:,.2f}"))
         with tab4:
             st.header("Funding & Financials (in Cr)")
-            st.dataframe(financials_display.T.style.format(lambda val: "-" if abs(val) < 1e-6 else f"₹{val:,.2f}"))
+            financials_to_display = financials_display[['Opening Cash', 'Net Cash Flow', 'Equity Inflow', 'Debt Drawdown', 'Debt Repayment', 'Closing Cash', 'Opening Debt', 'Closing Debt', 'Interest Expense']].copy()
+            financials_t = (financials_to_display).T
+            st.dataframe(financials_t.style.format(lambda val: "-" if abs(val) < 1e-9 else f"₹{val:,.2f}"))

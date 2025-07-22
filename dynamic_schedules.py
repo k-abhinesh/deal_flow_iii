@@ -1,7 +1,8 @@
+## dynamic_schedules.py
+
 import pandas as pd
 import numpy as np
 from math import ceil
-import os
 
 def _normalize_distribution(series):
     """Helper function to ensure a distribution series sums to exactly 1.0."""
@@ -72,21 +73,26 @@ def generate_construction_phasing(start_date, land_area_sqft, num_floors):
     df.loc["Finishing", project_timeline_labels[finishing_start_idx : finishing_end_idx + 1]] = 1.0 / finishing_q
     df.loc["Infra and Amenities", project_timeline_labels[infra_start_idx : infra_end_idx + 1]] = 1.0 / infra_q
 
+    # Convert to percentage
+    q_cols = [col for col in df.columns if isinstance(col, str) and col.startswith('Q')]
+    df[q_cols] = df[q_cols] * 100
+
     df.reset_index(inplace=True)
     df = df.rename(columns={'index': 'Stage'})
     
     return df, dynamic_project_end_date
 
 
-def generate_other_costs_phasing(master_timeline_q, project_end_date):
+def generate_other_costs_phasing(master_timeline_q, project_end_date, last_sales_quarter_label):
     """
     Generates phasing for other costs based on project rules.
     """
     project_end_date = pd.to_datetime(project_end_date)
     
-    cost_items = ['Consultant Cost', 'Marketing Cost', 'Misc. Approval Cost', 'Plan Sanction', 'Sales Lounge']
+    cost_items = ['Consultant Cost', 'Marketing Cost', 'Misc. Approval Cost', 'Plan Sanction', 'Sales Lounge', 'Admin Cost']
     df = pd.DataFrame(0.0, index=cost_items, columns=master_timeline_q)
     
+    # --- Consultant Cost Logic ---
     construction_end_period = pd.Period(project_end_date, freq='Q')
     construction_timeline_labels = [
         q for q in master_timeline_q 
@@ -94,6 +100,68 @@ def generate_other_costs_phasing(master_timeline_q, project_end_date):
     ]
     total_construction_q = len(construction_timeline_labels)
 
+    consultant_dist = pd.Series(0.0, index=construction_timeline_labels)
+    if total_construction_q > 0: consultant_dist.iloc[0] = 0.05
+    if total_construction_q > 1: consultant_dist.iloc[1] = 0.15
+    if total_construction_q > 2: consultant_dist.iloc[2] = 0.20
+    if total_construction_q > 3: consultant_dist.iloc[-1] = 0.05
+
+    if total_construction_q > 4:
+        fixed_pct_sum = consultant_dist.sum()
+        remaining_pct = 1.0 - fixed_pct_sum
+        middle_quarters = consultant_dist[consultant_dist == 0.0].index
+        if not middle_quarters.empty and remaining_pct > 0:
+            pct_per_q = remaining_pct / len(middle_quarters)
+            consultant_dist[middle_quarters] = pct_per_q
+            
+    df.loc['Consultant Cost', construction_timeline_labels] = _normalize_distribution(consultant_dist).values
+
+    # --- Marketing Cost Logic ---
+    last_sales_period = pd.Period(f"{last_sales_quarter_label.split(' ')[1]}{last_sales_quarter_label.split(' ')[0]}", freq='Q')
+    marketing_timeline_labels = [
+        q for q in master_timeline_q
+        if pd.Period(f"{q.split(' ')[1]}{q.split(' ')[0]}", freq='Q') <= last_sales_period
+    ]
+    total_marketing_q = len(marketing_timeline_labels)
+
+    marketing_dist = pd.Series(0.0, index=marketing_timeline_labels)
+    if total_marketing_q > 1: marketing_dist.iloc[1] = 0.05
+    if total_marketing_q > 2: marketing_dist.iloc[2] = 0.15
+    if total_marketing_q > 3: marketing_dist.iloc[3] = 0.15
+    
+    if total_marketing_q > 4:
+        remaining_pct = 1.0 - marketing_dist.sum()
+        distribute_quarters = marketing_dist.index[4:]
+        if not distribute_quarters.empty and remaining_pct > 0:
+            pct_per_q = remaining_pct / len(distribute_quarters)
+            marketing_dist[distribute_quarters] = pct_per_q
+
+    df.loc['Marketing Cost', marketing_timeline_labels] = _normalize_distribution(marketing_dist).values
+
+    # --- Admin Cost Logic ---
+    first_quarter_label = master_timeline_q[0]
+    first_admin_period = pd.Period(f"{first_quarter_label.split(' ')[1]}{first_quarter_label.split(' ')[0]}", freq='Q')
+    
+    admin_timeline_labels = [
+        q for q in master_timeline_q
+        if first_admin_period <= pd.Period(f"{q.split(' ')[1]}{q.split(' ')[0]}", freq='Q') <= last_sales_period
+    ]
+    total_admin_q = len(admin_timeline_labels)
+
+    admin_dist = pd.Series(0.0, index=admin_timeline_labels)
+    if total_admin_q > 0: admin_dist.iloc[0] = 0.005
+    if total_admin_q > 1: admin_dist.iloc[1] = 0.005
+
+    if total_admin_q > 2:
+        remaining_pct = 1.0 - admin_dist.sum()
+        distribute_quarters = admin_dist.index[2:]
+        if not distribute_quarters.empty and remaining_pct > 0:
+            pct_per_q = remaining_pct / len(distribute_quarters)
+            admin_dist[distribute_quarters] = pct_per_q
+            
+    df.loc['Admin Cost', admin_timeline_labels] = _normalize_distribution(admin_dist).values
+
+    # --- Other Fixed Costs ---
     if len(master_timeline_q) > 1: df.loc['Plan Sanction', master_timeline_q[1]] = 1.0
     if len(master_timeline_q) > 2:
         df.loc['Sales Lounge', master_timeline_q[1]] = 0.5
@@ -102,39 +170,11 @@ def generate_other_costs_phasing(master_timeline_q, project_end_date):
     project_end_q_label = f"Q{project_end_date.quarter} {project_end_date.year}"
     if project_end_q_label in df.columns:
         df.loc['Misc. Approval Cost', project_end_q_label] = 1.0
+    
+    # Convert to percentage
+    q_cols = [col for col in df.columns if isinstance(col, str) and col.startswith('Q')]
+    df[q_cols] = df[q_cols] * 100
 
-    consultant_dist = pd.Series(0.0, index=construction_timeline_labels)
-    if total_construction_q > 0: consultant_dist.iloc[0] = 0.05
-    if total_construction_q > 1: consultant_dist.iloc[1] = 0.15
-    if total_construction_q > 2: consultant_dist.iloc[2] = 0.20
-    
-    if total_construction_q > 8:
-        middle_start_idx = 3
-        middle_end_idx = total_construction_q - 5
-        consultant_dist.iloc[middle_end_idx:] = 0.05
-        if middle_end_idx > middle_start_idx:
-            middle_len = middle_end_idx - middle_start_idx
-            middle_values = np.linspace(0.05, 0.025, middle_len)
-            consultant_dist.iloc[middle_start_idx:middle_end_idx] = middle_values
-    df.loc['Consultant Cost', construction_timeline_labels] = _normalize_distribution(consultant_dist).values
-
-    # Updated marketing cost distribution logic
-    marketing_dist = pd.Series(0.0, index=construction_timeline_labels)
-    if total_construction_q > 1: marketing_dist.iloc[1] = 0.05  # Q2: 5%
-    if total_construction_q > 2: marketing_dist.iloc[2] = 0.15  # Q3: 15%
-    if total_construction_q > 3: marketing_dist.iloc[3] = 0.15  # Q4: 15%
-    
-    # After the initial ramp-up, immediately start a gradual decline to 5%
-    if total_construction_q > 4:
-        taper_start_idx = 4 # Start tapering from the 5th quarter
-        taper_len = total_construction_q - taper_start_idx
-        if taper_len > 0:
-            # FIX: Create a smooth decline from 10% down to 5%
-            taper_values = np.linspace(0.10, 0.05, taper_len) 
-            marketing_dist.iloc[taper_start_idx:] = taper_values
-            
-    df.loc['Marketing Cost', construction_timeline_labels] = _normalize_distribution(marketing_dist).values
-    
     df.reset_index(inplace=True)
     df = df.rename(columns={'index': 'Cost Item'})
     return df
@@ -153,17 +193,25 @@ def generate_sales_distribution(master_timeline_q, project_end_date):
     if len(df) > sales_start_idx:     df.iloc[sales_start_idx, 0] = 0.15
     if len(df) > sales_start_idx + 1: df.iloc[sales_start_idx + 1, 0] = 0.15
         
-    post_project_q = pd.Period(project_end_date, freq='Q') + 1
-    post_project_q_label = f"Q{post_project_q.quarter} {post_project_q.year}"
-    if post_project_q_label in df.index:
-        df.loc[post_project_q_label, 'Distribution'] = 0.20
+    post_construction_start_period = pd.Period(project_end_date, freq='Q') + 1
+    post_construction_labels = []
+    for i in range(4):
+        current_period = post_construction_start_period + i
+        current_label = f"Q{current_period.quarter} {current_period.year}"
+        if current_label in df.index:
+            df.loc[current_label, 'Distribution'] = 0.05
+            post_construction_labels.append(current_label)
     
     remaining_pct = 1.0 - df['Distribution'].sum()
-    dist_start_idx = sales_start_idx + 2
     
-    try:
-        dist_end_idx = df.index.get_loc(post_project_q_label)
-    except KeyError:
+    dist_start_idx = sales_start_idx + 2
+    dist_end_idx = -1
+    if post_construction_labels:
+        try:
+            dist_end_idx = df.index.get_loc(post_construction_labels[0])
+        except KeyError:
+            dist_end_idx = len(df)
+    else:
         dist_end_idx = len(df)
 
     if dist_end_idx > dist_start_idx:
@@ -173,6 +221,10 @@ def generate_sales_distribution(master_timeline_q, project_end_date):
             df.iloc[dist_start_idx:dist_end_idx, 0] = pct_per_q
     
     df['Distribution'] = _normalize_distribution(df['Distribution'])
+    
+    # Convert to percentage
+    df['Distribution'] = df['Distribution'] * 100
+    
     return df.reset_index()
 
 
@@ -180,7 +232,8 @@ def generate_collection_distribution(sales_dist_df, master_timeline_q):
     """
     Generates a collection distribution based on a lag from sales.
     """
-    sales_series = sales_dist_df.set_index('Quarter')['Distribution']
+    # Convert incoming sales percentages back to decimals for calculation
+    sales_series = sales_dist_df.set_index('Quarter')['Distribution'] / 100.0
     collections = pd.Series(0.0, index=master_timeline_q)
 
     for quarter, sales_pct in sales_series.items():
@@ -195,32 +248,8 @@ def generate_collection_distribution(sales_dist_df, master_timeline_q):
                 continue
 
     collections = _normalize_distribution(collections)
+    
+    # Convert final distribution to percentage
+    collections = collections * 100
+    
     return pd.DataFrame({'Quarter': collections.index, 'Distribution': collections.values})
-
-
-def generate_admin_cost_schedule(total_saleable_area, admin_timeline_q):
-    """
-    Generates the admin cost schedule with extra empty columns for editing.
-    """
-    if not admin_timeline_q or total_saleable_area == 0:
-        return pd.DataFrame({'Quarter': admin_timeline_q, 'Cost per Quarter': 0.0})
-
-    total_admin_cost = 1500 * total_saleable_area
-    quarterly_admin_cost = total_admin_cost / len(admin_timeline_q)
-    
-    extended_admin_timeline = list(admin_timeline_q)
-    if admin_timeline_q:
-        last_q_str = admin_timeline_q[-1]
-        last_q = pd.Period(f"{last_q_str.split(' ')[1]}{last_q_str.split(' ')[0]}", freq='Q')
-        for i in range(1, 9):
-            next_q = last_q + i
-            extended_admin_timeline.append(f"Q{next_q.quarter} {next_q.year}")
-        
-    df = pd.DataFrame({
-        'Quarter': admin_timeline_q,
-        'Cost per Quarter': quarterly_admin_cost
-    })
-    
-    df = df.set_index('Quarter').reindex(extended_admin_timeline, fill_value=0).reset_index()
-    
-    return df
